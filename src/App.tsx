@@ -10,6 +10,12 @@ const MAX_VIDEO_MB = 100
 const MAX_VIDEO_SECONDS = 30
 const FALLBACK_MAX_MB = 20
 
+/* ===================== CALIDAD DE FOTOS Y VIDEOS ===================== */
+// Más calidad = archivos más pesados (y más espacio en Drive).
+const PHOTO_MAX_SIDE = 4096 // lado largo máximo de las fotos con filtro (0 = tamaño original)
+const PHOTO_QUALITY = 0.95 // calidad JPEG de las fotos con filtro (0 a 1)
+const VIDEO_BITRATE = 10_000_000 // calidad del video de la cámara en vivo (10 Mbps ≈ 40 MB por 30 s)
+
 /* ================================ TIPOS ================================ */
 type DriveFile = { id: string; name: string; mimeType: string; createdTime: string; thumbnailLink?: string }
 type Upload = { id: number; progress: number; status: 'subiendo' | 'listo' | 'error' }
@@ -119,20 +125,24 @@ async function uploadOne(file: File, uploader: string, onProgress: (p: number) =
   onProgress(100)
 }
 
-/** Redimensiona a 1600 px y hornea el filtro elegido en la imagen final */
+/**
+ * Sin filtro: la foto se sube ORIGINAL, sin tocarla (máxima calidad).
+ * Con filtro: se aplica a la mayor resolución posible, con calidad JPEG alta.
+ */
 async function prepareImage(file: File, css: string): Promise<File> {
-  if (!file.type.startsWith('image/') || (file.type === 'image/gif' && css === 'none')) return file
+  if (!file.type.startsWith('image/') || css === 'none') return file
   try {
     const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' })
-    const scale = Math.min(1, 1600 / Math.max(bmp.width, bmp.height))
+    const scale = PHOTO_MAX_SIDE > 0 ? Math.min(1, PHOTO_MAX_SIDE / Math.max(bmp.width, bmp.height)) : 1
     const c = document.createElement('canvas')
     c.width = Math.round(bmp.width * scale)
     c.height = Math.round(bmp.height * scale)
     const ctx = c.getContext('2d')!
+    ctx.imageSmoothingQuality = 'high'
     ctx.filter = css
     ctx.drawImage(bmp, 0, 0, c.width, c.height)
-    const blob = await new Promise<Blob | null>((res) => c.toBlob(res, 'image/jpeg', 0.85))
-    if (!blob || (css === 'none' && blob.size >= file.size)) return file
+    const blob = await new Promise<Blob | null>((res) => c.toBlob(res, 'image/jpeg', PHOTO_QUALITY))
+    if (!blob) return file
     return new File([blob], file.name.replace(/\.\w+$/, '') + '.jpg', { type: 'image/jpeg' })
   } catch {
     return file
@@ -151,6 +161,8 @@ function explain(err: unknown): string {
 }
 
 const driveThumb = (id: string, w = 400) => `https://drive.google.com/thumbnail?id=${id}&sz=w${w}`
+/** Imagen grande directa de Google (requiere que el archivo sea visible por enlace) */
+const fullImg = (id: string) => `https://lh3.googleusercontent.com/d/${id}=w2560`
 /** Prefiere la miniatura que entrega la API de Drive (no depende de que el archivo sea público) */
 const thumb = (f: DriveFile, w = 400) => (f.thumbnailLink ? f.thumbnailLink.replace(/=s\d+.*$/, `=w${w}`) : driveThumb(f.id, w))
 const uploaderOf = (name: string) => {
@@ -180,6 +192,23 @@ function Avatar({ label, size = 32 }: { label: string; size?: number }) {
       <span className="flex h-full w-full items-center justify-center rounded-full bg-white text-xs font-semibold text-ink">{label}</span>
     </span>
   )
+}
+
+/** Foto a la resolución máxima del sensor (Chrome en Android). Devuelve null si el navegador no lo permite */
+async function takeStill(track: MediaStreamTrack): Promise<Blob | null> {
+  type IC = {
+    getPhotoCapabilities(): Promise<{ imageWidth?: { max: number }; imageHeight?: { max: number } }>
+    takePhoto(s?: { imageWidth?: number; imageHeight?: number }): Promise<Blob>
+  }
+  const Ctor = (window as unknown as { ImageCapture?: new (t: MediaStreamTrack) => IC }).ImageCapture
+  if (!Ctor) return null
+  try {
+    const ic = new Ctor(track)
+    const caps = await ic.getPhotoCapabilities().catch(() => null)
+    return await ic.takePhoto(caps?.imageWidth && caps?.imageHeight ? { imageWidth: caps.imageWidth.max, imageHeight: caps.imageHeight.max } : undefined)
+  } catch {
+    return null
+  }
 }
 
 /* ============================ CÁMARA ============================ */
@@ -229,7 +258,12 @@ function CameraScreen({ name, status, count, onShot, onPick, onNative, onName, o
       if (!navigator.mediaDevices?.getUserMedia) return setError('Este navegador no permite abrir la cámara aquí.')
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: { ideal: facing }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+          video: {
+            facingMode: { ideal: facing },
+            width: { ideal: mode === 'foto' ? 4096 : 1920 },
+            height: { ideal: mode === 'foto' ? 3072 : 1080 },
+            frameRate: { ideal: 30 },
+          },
           audio: mode === 'video',
         })
         if (cancelled) return stream.getTracks().forEach((t) => t.stop())
@@ -266,7 +300,15 @@ function CameraScreen({ name, status, count, onShot, onPick, onNative, onName, o
     if (rec && secs >= MAX_VIDEO_SECONDS) stopRec()
   }, [rec, secs, stopRec])
 
-  const snap = () => {
+  const snap = async () => {
+    setFlash(true)
+    setTimeout(() => setFlash(false), 120)
+    navigator.vibrate?.(30)
+    const track = streamRef.current?.getVideoTracks()[0]
+    if (facing === 'environment' && track) {
+      const still = await takeStill(track) // máxima resolución del sensor
+      if (still) return onShot(new File([still], `foto-${Date.now()}.jpg`, { type: still.type || 'image/jpeg' }), flt.css)
+    }
     const v = videoEl.current
     if (!v || !v.videoWidth) return
     const c = document.createElement('canvas')
@@ -278,16 +320,14 @@ function CameraScreen({ name, status, count, onShot, onPick, onNative, onName, o
       ctx.scale(-1, 1)
     }
     ctx.drawImage(v, 0, 0)
-    setFlash(true)
-    setTimeout(() => setFlash(false), 120)
-    c.toBlob((b) => b && (navigator.vibrate?.(30), onShot(new File([b], `foto-${Date.now()}.jpg`, { type: 'image/jpeg' }), flt.css)), 'image/jpeg', 0.92)
+    c.toBlob((b) => b && onShot(new File([b], `foto-${Date.now()}.jpg`, { type: 'image/jpeg' }), flt.css), 'image/jpeg', 0.98)
   }
 
   const startRec = () => {
     const stream = streamRef.current
     if (!stream || typeof MediaRecorder === 'undefined') return setError('Este navegador no puede grabar video aquí. Usa la opción "Grabar video".')
     const type = ['video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'].find((t) => MediaRecorder.isTypeSupported(t)) ?? ''
-    const r = new MediaRecorder(stream, { ...(type ? { mimeType: type } : {}), videoBitsPerSecond: 3_000_000 })
+    const r = new MediaRecorder(stream, { ...(type ? { mimeType: type } : {}), videoBitsPerSecond: VIDEO_BITRATE })
     chunks.current = []
     r.ondataavailable = (e) => e.data.size > 0 && chunks.current.push(e.data)
     r.onstop = () => {
@@ -471,6 +511,13 @@ function Ornament() {
   )
 }
 
+/** Foto grande del visor: prueba varias direcciones hasta encontrar la de mayor calidad que cargue */
+function FullImage({ f, onDouble }: { f: DriveFile; onDouble: () => void }) {
+  const sources = useMemo(() => [thumb(f, 2560), fullImg(f.id), driveThumb(f.id, 2000)], [f])
+  const [i, setI] = useState(0)
+  return <img key={sources[i]} src={sources[i]} alt="" onError={() => setI((n) => Math.min(n + 1, sources.length - 1))} onDoubleClick={onDouble} className="mx-auto max-h-[62vh] w-full object-contain" />
+}
+
 function GalleryScreen({ files, next, loading, problem, onRefresh, onMore, onBack }: GalleryProps) {
   const [filter, setFilter] = useState<Filter>('todo')
   const [openIdx, setOpenIdx] = useState<number | null>(null)
@@ -483,7 +530,7 @@ function GalleryScreen({ files, next, loading, problem, onRefresh, onMore, onBac
   const onBroken = (im: HTMLImageElement, id: string) => {
     if (!im.dataset.fb) {
       im.dataset.fb = '1'
-      im.src = driveThumb(id, 600)
+      im.src = driveThumb(id, 900)
       return
     }
     im.style.visibility = 'hidden'
@@ -580,7 +627,7 @@ function GalleryScreen({ files, next, loading, problem, onRefresh, onMore, onBac
                   className={`rise group relative mb-5 block w-full break-inside-avoid bg-white p-2 pb-9 shadow-lg shadow-wine/15 transition duration-500 hover:z-10 hover:rotate-0 hover:scale-[1.04] hover:shadow-2xl ${TILTS[i % 4]}`}
                 >
                   <div className={`relative overflow-hidden bg-blush ${RATIOS[(i * 3) % 4]}`}>
-                    <img src={thumb(f, 600)} alt="" loading="lazy" className="h-full w-full object-cover transition duration-700 group-hover:scale-110" onError={(e) => onBroken(e.currentTarget, f.id)} />
+                    <img src={thumb(f, 900)} alt="" loading="lazy" className="h-full w-full object-cover transition duration-700 group-hover:scale-110" onError={(e) => onBroken(e.currentTarget, f.id)} />
                     <span className="absolute inset-0 bg-gradient-to-t from-wine/45 via-transparent to-transparent opacity-0 transition duration-500 group-hover:opacity-100" />
                     {f.mimeType.startsWith('video/') && (
                       <span className="absolute inset-0 flex items-center justify-center">
@@ -627,7 +674,7 @@ function GalleryScreen({ files, next, loading, problem, onRefresh, onMore, onBac
               {current.mimeType.startsWith('video/') ? (
                 <iframe title="Video" src={`https://drive.google.com/file/d/${current.id}/preview`} allow="autoplay; fullscreen" allowFullScreen className="aspect-video w-full border-0" />
               ) : (
-                <img src={thumb(current, 1600)} alt="" onDoubleClick={() => !liked.has(current.id) && toggleLike(current.id)} className="mx-auto max-h-[62vh] w-full object-contain" />
+                <FullImage key={current.id} f={current} onDouble={() => !liked.has(current.id) && toggleLike(current.id)} />
               )}
               <div className="mt-4 text-center">
                 <p className="font-script text-4xl text-wine">{uploaderOf(current.name) || 'Invitado'}</p>
